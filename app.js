@@ -109,6 +109,83 @@ async function miniatura(blob) {
   } catch { return blob; }
 }
 
+// Fecha de disparo (DateTimeOriginal) leída de los metadatos EXIF de un JPEG.
+// Devuelve null si la imagen no los tiene.
+async function fechaExif(blob) {
+  try {
+    const d = new DataView(await blob.slice(0, 256 * 1024).arrayBuffer());
+    if (d.getUint16(0) !== 0xFFD8) return null;
+    let p = 2;
+    while (p + 4 < d.byteLength) {
+      const marcador = d.getUint16(p);
+      const largo = d.getUint16(p + 2);
+      if (marcador === 0xFFE1 && d.getUint32(p + 4) === 0x45786966) { // «Exif»
+        const t = p + 10;                                          // cabecera TIFF
+        const le = d.getUint16(t) === 0x4949;
+        const u16 = o => d.getUint16(t + o, le);
+        const u32 = o => d.getUint32(t + o, le);
+        const buscar = (ifd, etiqueta) => {
+          const n = u16(ifd);
+          for (let i = 0; i < n; i++) {
+            const e = ifd + 2 + i * 12;
+            if (u16(e) === etiqueta) return e;
+          }
+          return null;
+        };
+        const texto = e => {
+          let s = '';
+          for (let i = 0; i < 19; i++) s += String.fromCharCode(d.getUint8(t + u32(e + 8) + i));
+          return s;
+        };
+        const ifd0 = u32(4);
+        let e = null;
+        const punteroExif = buscar(ifd0, 0x8769);
+        if (punteroExif) e = buscar(u32(punteroExif + 8), 0x9003);   // DateTimeOriginal
+        e ||= buscar(ifd0, 0x0132);                                   // DateTime
+        if (!e) return null;
+        const m = texto(e).match(/^(\d{4}):(\d\d):(\d\d) (\d\d):(\d\d):(\d\d)/);
+        return m ? new Date(+m[1], m[2] - 1, +m[3], +m[4], +m[5], +m[6]) : null;
+      }
+      if ((marcador & 0xFF00) !== 0xFF00) break;
+      p += 2 + largo;
+    }
+  } catch { /* EXIF ilegible */ }
+  return null;
+}
+
+const textoMarca = iso => {
+  const d = new Date(iso);
+  return `${dos(d.getDate())}/${dos(d.getMonth() + 1)}/${d.getFullYear()}  ${dos(d.getHours())}:${dos(d.getMinutes())}`;
+};
+
+// Copia de la foto con la fecha y hora de captura impresas abajo a la derecha.
+// El original no se toca: esta copia pierde los metadatos EXIF.
+async function imagenConMarca(blob, iso) {
+  const bmp = await createImageBitmap(blob);
+  const c = document.createElement('canvas');
+  c.width = bmp.width;
+  c.height = bmp.height;
+  const g = c.getContext('2d');
+  g.drawImage(bmp, 0, 0);
+  bmp.close?.();
+  const texto = textoMarca(iso);
+  const alto = Math.round(Math.max(18, Math.min(c.width, c.height) * 0.04));
+  g.font = `600 ${alto}px system-ui, sans-serif`;
+  const ancho = g.measureText(texto).width;
+  const relleno = Math.round(alto * 0.4);           // entre texto y borde del recuadro
+  const separacion = Math.round(alto * 0.8);        // entre recuadro y borde de la foto
+  const anchoCaja = ancho + relleno * 2;
+  const altoCaja = alto + relleno * 2;
+  const x = c.width - separacion - anchoCaja;
+  const y = c.height - separacion - altoCaja;
+  g.fillStyle = 'rgba(0,0,0,0.55)';
+  g.fillRect(x, y, anchoCaja, altoCaja);
+  g.fillStyle = '#ffd200';
+  g.textBaseline = 'top';
+  g.fillText(texto, x + relleno, y + relleno);
+  return new Promise(ok => c.toBlob(ok, 'image/jpeg', 0.92));
+}
+
 /* ---------- dictado (reconocimiento de voz del navegador) ---------- */
 
 const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
@@ -290,6 +367,10 @@ const Drive = {
     return (await this.api(`files/${id}?alt=media`)).text();
   },
 
+  async renombrar(id, nombre) {
+    await this.api(`files/${id}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: nombre }) });
+  },
+
   async papelera(id) {
     await this.api(`files/${id}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: '{"trashed":true}' });
   },
@@ -301,6 +382,9 @@ const nombreCarpetaExp = e => `${e.codigo}_${slug(e.nombre)}`;
 const nombreCarpetaVisita = v => `${fechaISO(new Date(v.inicio))}_${hora(v.inicio).replace(':', '')}_${TIPOS[v.tipo].carpeta}`;
 const archivoFoto = (f, tipo) => `${nFoto(f.n)}.${extension(tipo || f.tipoImg || 'image/jpeg')}`;
 const archivoAudio = f => `${nFoto(f.n)}_audio.${extension(f.tipoAudio || 'audio/webm')}`;
+const archivoMarca = f => `${nFoto(f.n)}_marca.jpg`;
+// La foto que debe ir al informe: la marcada si la visita lleva marca y ya está generada.
+const archivoInforme = (v, f) => (v.marcaAgua ? archivoMarca(f) : archivoFoto(f));
 
 function generarMD(v) {
   const e = v.expediente;
@@ -313,16 +397,23 @@ function generarMD(v) {
   l.push(`| Hora | ${hora(v.inicio)}${v.fin ? ' – ' + hora(v.fin) : ' (en curso)'} |`);
   l.push(`| Estado | ${v.estado === 'cerrada' ? 'Visita cerrada' : 'Visita abierta: pueden añadirse más fotografías'} |`);
   l.push(`| Fotografías | ${v.fotos.length} |`);
+  l.push(`| Marca de fecha y hora | ${v.marcaAgua ? 'Sí' : 'No'} |`);
   l.push('');
   l.push('> Registro de campo tomado con la app «Visitas de obra». Las descripciones son');
   l.push('> **observaciones del técnico dictadas en la visita** y transcritas automáticamente;');
   l.push('> pueden contener errores de transcripción. Cuando existe, el audio original prevalece');
   l.push('> sobre el texto.');
+  if (v.marcaAgua) {
+    l.push('>');
+    l.push('> Las imágenes `Fnn_marca.jpg` llevan impresas la fecha y hora de captura y son las que');
+    l.push('> se usan en el informe. `Fnn.jpg` es el **original intacto, con sus metadatos EXIF**.');
+  }
   l.push('');
   l.push('## Fotografías y observaciones', '');
   for (const f of v.fotos) {
-    l.push(`### ${nFoto(f.n)} — ${hora(f.hora)}`, '');
-    l.push(`![${nFoto(f.n)}](${archivoFoto(f)})`, '');
+    l.push(`### ${nFoto(f.n)} — ${fechaCorta(f.hora)} ${hora(f.hora)}`, '');
+    l.push(`![${nFoto(f.n)}](${archivoInforme(v, f)})`, '');
+    if (v.marcaAgua) l.push(`*Original: \`${archivoFoto(f)}\`*`, '');
     l.push(f.descripcion?.trim() ? f.descripcion.trim() : '*Sin descripción.*', '');
     if (f.audio) {
       l.push(`*Audio original: \`${archivoAudio(f)}\`${f.pendienteTranscribir ? ' — **pendiente de transcribir**' : ''}.*`, '');
@@ -333,17 +424,20 @@ function generarMD(v) {
 
 function generarJSON(v) {
   return JSON.stringify({
-    formato: 'visitas-obra/1',
+    formato: 'visitas-obra/2',
     expediente: v.expediente,
     tipo: v.tipo,
     tipo_nombre: TIPOS[v.tipo].nombre,
     inicio: v.inicio,
     fin: v.fin || null,
     estado: v.estado,
+    marca_agua: !!v.marcaAgua,
     fotos: v.fotos.map(f => ({
       id: nFoto(f.n),
       hora: f.hora,
+      hora_origen: f.origenHora || 'dispositivo', // exif = fecha de disparo leída de la propia foto
       archivo: archivoFoto(f),
+      archivo_marca: v.marcaAgua ? archivoMarca(f) : null,
       descripcion: f.descripcion || '',
       audio: f.audio ? archivoAudio(f) : null,
       pendiente_transcribir: !!f.pendienteTranscribir,
@@ -351,6 +445,7 @@ function generarJSON(v) {
   }, null, 2);
 }
 
+const VERSION_LEEME = 3; // subir al cambiar el texto, para que se vuelva a copiar a Drive
 const LEEME_DRIVE = `# VISITAS-OBRA — Registro de campo del estudio
 
 Carpeta generada por la app «Visitas de obra». No renombrar ni mover las carpetas a mano.
@@ -361,7 +456,8 @@ Carpeta generada por la app «Visitas de obra». No renombrar ni mover las carpe
       expedientes.json                 lista de expedientes (código y nombre)
       <CÓDIGO>_<nombre>/               una carpeta por expediente
         <AAAA-MM-DD>_<HHMM>_<tipo>/    una carpeta por visita; tipo = obra | toma-datos
-          F01.jpg, F02.jpg…            fotografías, numeradas por orden de toma
+          F01.jpg, F02.jpg…            fotografías ORIGINALES, intactas y con metadatos EXIF
+          F01_marca.jpg…               copia con fecha y hora impresas (si la visita lleva marca)
           F01_audio.webm…              audio original, solo si se grabó
           visita.md                    fotos + observaciones dictadas (legible)
           visita.json                  los mismos datos, estructurados
@@ -371,7 +467,12 @@ Carpeta generada por la app «Visitas de obra». No renombrar ni mover las carpe
 - Las descripciones son observaciones del técnico transcritas de voz: respetar el
   contenido y corregir solo errores evidentes de transcripción, señalándolo.
 - Una foto marcada «pendiente de transcribir» tiene el audio pero no el texto.
-- La numeración F01, F02… no se reordena: es la referencia de campo de cada foto.
+- La numeración F01, F02… es siempre correlativa y sigue el orden de toma. Si en la
+  visita se borra una foto, las siguientes se renumeran (y sus archivos se renombran),
+  de modo que nunca hay huecos: la lista de visita.md es completa y consecutiva.
+- En los informes se inserta la imagen que indica visita.md: la copia _marca si existe.
+  El original sin marca es la prueba con metadatos; no se edita ni se sustituye.
+  La fecha impresa procede del EXIF de la foto (hora_origen = "exif" en visita.json).
 - Para los informes, el contenido de visita.md alimenta el diario de visitas del
   expediente (00-SISTEMA/plantillas/informes/PLANTILLA_diario-de-visitas.md),
   apartado «Lo que se observa» y tabla «Fotografías y vídeo».
@@ -383,10 +484,12 @@ let sincronizando = false;
 
 // Copia los identificadores de Drive sobre la versión actual de la visita,
 // sin pisar ediciones que el usuario haya hecho durante la subida.
-async function guardarProgresoDrive(v, terminado) {
+async function guardarProgresoDrive(v, terminado, tirados = new Set()) {
   const actual = await DB.get('visitas', v.id);
   if (!actual) return;
-  actual.drive = v.drive;
+  // La papelera se conserva de la versión actual: pudo recibir borrados durante la subida.
+  const papelera = (actual.drive?.papelera || []).filter(id => !tirados.has(id));
+  actual.drive = { ...v.drive, papelera };
   for (const f of actual.fotos) {
     const subida = v.fotos.find(x => x.id === f.id);
     if (subida) f.drive = subida.drive;
@@ -407,30 +510,56 @@ async function subirVisita(id, raiz) {
     await guardarProgresoDrive(v);
   }
   const carpeta = v.drive.carpeta;
-  for (const f of v.fotos) {
-    f.drive ||= {};
-    if (!f.drive.img) {
-      const b = await DB.get('blobs', f.id + ':img');
-      if (b) {
-        f.drive.img = await Drive.subir(b, archivoFoto(f), carpeta, b.type || 'image/jpeg');
-        await guardarProgresoDrive(v);
-      }
-    }
-    if (f.audio && !f.drive.audio) {
-      const b = await DB.get('blobs', f.id + ':audio');
-      if (b) {
-        f.drive.audio = await Drive.subir(b, archivoAudio(f), carpeta, b.type || 'audio/webm');
-        await guardarProgresoDrive(v);
-      }
-    }
-  }
-  for (const idDrive of v.drive.papelera || []) {
+  // Primero la papelera, para que al renumerar no convivan dos archivos con el mismo nombre.
+  const tirados = new Set(v.drive.papelera || []);
+  for (const idDrive of tirados) {
     try { await Drive.papelera(idDrive); } catch { /* ya no existe */ }
   }
   v.drive.papelera = [];
+  const progreso = () => guardarProgresoDrive(v, false, tirados);
+
+  // Cada foto tiene hasta tres archivos en Drive: original, copia con marca y audio.
+  // Para cada uno: se sube si falta y se renombra si la foto cambió de número.
+  const archivos = [
+    { id: 'img', nom: 'nombreImg', nombre: archivoFoto, quiere: () => true,
+      contenido: f => DB.get('blobs', f.id + ':img') },
+    { id: 'marca', nom: 'nombreMarca', nombre: archivoMarca, quiere: () => !!v.marcaAgua,
+      contenido: async f => {
+        const b = await DB.get('blobs', f.id + ':img');
+        return b && imagenConMarca(b, f.hora);
+      } },
+    { id: 'audio', nom: 'nombreAudio', nombre: archivoAudio, quiere: f => f.audio,
+      contenido: f => DB.get('blobs', f.id + ':audio') },
+  ];
+
+  for (const f of v.fotos) {
+    f.drive ||= {};
+    for (const a of archivos) {
+      const id = f.drive[a.id];
+      if (!a.quiere(f)) {
+        if (id) { // p. ej. se desactivó la marca: la copia marcada va a la papelera
+          try { await Drive.papelera(id); } catch { /* ya no existe */ }
+          f.drive[a.id] = null;
+          await progreso();
+        }
+        continue;
+      }
+      if (!id) {
+        const b = await a.contenido(f);
+        if (!b) continue;
+        f.drive[a.id] = await Drive.subir(b, a.nombre(f), carpeta, b.type || 'application/octet-stream');
+        f.drive[a.nom] = a.nombre(f);
+        await progreso();
+      } else if (f.drive[a.nom] !== a.nombre(f)) {
+        await Drive.renombrar(id, a.nombre(f));
+        f.drive[a.nom] = a.nombre(f);
+        await progreso();
+      }
+    }
+  }
   v.drive.md = await Drive.subir(new Blob([generarMD(v)], { type: 'text/markdown' }), 'visita.md', carpeta, 'text/markdown', v.drive.md);
   v.drive.json = await Drive.subir(new Blob([generarJSON(v)], { type: 'application/json' }), 'visita.json', carpeta, 'application/json', v.drive.json);
-  await guardarProgresoDrive(v, true);
+  await guardarProgresoDrive(v, true, tirados);
 }
 
 // expedientes.json en Drive es la lista común entre dispositivos; se fusiona con la local.
@@ -460,9 +589,9 @@ async function sincronizar(interactivo) {
   try {
     await Drive.autorizar(cid);
     const raiz = await Drive.carpeta(CFG.DRIVE_ROOT);
-    if (!(await ajuste.leer('leemeSubido'))) {
+    if ((await ajuste.leer('leemeVersion')) !== VERSION_LEEME) {
       await Drive.subir(new Blob([LEEME_DRIVE], { type: 'text/markdown' }), 'LEEME.md', raiz, 'text/markdown', await Drive.buscar('LEEME.md', raiz, false));
-      await ajuste.poner('leemeSubido', true);
+      await ajuste.poner('leemeVersion', VERSION_LEEME);
     }
     await sincronizarExpedientes(raiz);
     for (const v of pendientes) await subirVisita(v.id, raiz);
@@ -497,10 +626,14 @@ async function recibirFotos(archivos) {
   const v = await DB.get('visitas', destinoFotos);
   let ultima;
   for (const archivo of archivos) {
+    // La hora de la foto es la de disparo guardada en la propia imagen; si no la tiene,
+    // la del momento (cámara) o la del archivo (galería).
+    const exif = await fechaExif(archivo);
     const f = {
       id: uid(),
-      n: v.siguiente++,
-      hora: new Date(archivos.length > 1 ? archivo.lastModified : Date.now()).toISOString(),
+      n: v.fotos.length + 1,
+      hora: (exif || new Date(archivos.length > 1 ? archivo.lastModified : Date.now())).toISOString(),
+      origenHora: exif ? 'exif' : 'dispositivo',
       tipoImg: archivo.type || 'image/jpeg',
       descripcion: '',
       audio: false,
@@ -526,9 +659,15 @@ let urlsTemporales = [];
 const urlDe = blob => { const u = URL.createObjectURL(blob); urlsTemporales.push(u); return u; };
 
 function etiquetaSync(v) {
-  if (v.sync === 'subida') return '<span class="etiqueta ok">✓ En Drive</span>';
-  return '<span class="etiqueta pend">Pendiente de subir</span>';
+  const cuando = v.subidaEn ? ` · ${fechaISO(new Date(v.subidaEn)) === fechaISO(new Date()) ? '' : fechaCorta(v.subidaEn) + ' '}${hora(v.subidaEn)}` : '';
+  if (v.sync === 'subida') return `<span class="etiqueta ok">✓ En Drive${cuando}</span>`;
+  return v.subidaEn
+    ? '<span class="etiqueta pend">● Cambios sin subir</span>'
+    : '<span class="etiqueta pend">● Pendiente de subir</span>';
 }
+
+// Marca de fecha y hora por defecto en visitas nuevas: activada salvo que se desactive en Ajustes.
+const marcaPorDefecto = async () => (await ajuste.leer('marcaAgua')) !== false;
 
 async function vistaInicio() {
   const visitas = (await DB.todos('visitas')).sort((a, b) => b.inicio.localeCompare(a.inicio));
@@ -538,10 +677,10 @@ async function vistaInicio() {
     <header class="barra"><h1>Visitas de obra</h1><a class="icono" href="#/ajustes" aria-label="Ajustes">⚙</a></header>
     <main>
       <a class="btn primario grande" href="#/nueva">+ Nueva visita</a>
-      <div class="estado">
-        <span><i class="punto ${enLinea ? '' : 'off'}"></i>${enLinea ? 'Con conexión' : 'Sin cobertura'} ·
-          ${pendientes ? `${pendientes} pendiente(s) de subir` : 'todo subido'}</span>
-        <button id="sync" class="btn peq" ${enLinea ? '' : 'disabled'}>Sincronizar</button>
+      <div class="estado ${pendientes ? 'pendiente' : ''}">
+        <span><i class="punto ${enLinea ? '' : 'off'}"></i>${enLinea ? 'Con conexión' : 'Sin cobertura'}<br>
+          <b>${pendientes ? `${pendientes} visita(s) con cambios sin subir` : '✓ Todo subido a Drive'}</b></span>
+        <button id="sync" class="btn peq ${pendientes ? 'primario' : ''}" ${enLinea ? '' : 'disabled'}>Subir a Drive</button>
       </div>
       <h2>Visitas registradas</h2>
       ${visitas.length ? `<ul class="lista">${visitas.map(v => `
@@ -579,6 +718,9 @@ async function vistaNueva() {
         <input id="nombre" type="text" placeholder="Rúa Vila de Noia 70-72">
         <p class="ayuda">Se añadirá a la lista común al sincronizar con Drive.</p>
       </div>
+      <h2>Fotografías</h2>
+      <label class="interruptor"><input id="marca" type="checkbox" ${(await marcaPorDefecto()) ? 'checked' : ''}>
+        <span>Imprimir fecha y hora en las fotos<small>Se conserva además el original sin marca.</small></span></label>
       <div style="margin-top:24px"><button id="empezar" class="btn primario grande">Empezar visita</button></div>
     </main>`;
   const sel = $('#exp');
@@ -602,7 +744,7 @@ async function vistaNueva() {
     const v = {
       id: uid(), tipo, expediente: { codigo: exp.codigo, nombre: exp.nombre },
       inicio: new Date().toISOString(), fin: null, estado: 'abierta',
-      fotos: [], siguiente: 1, drive: {},
+      marcaAgua: $('#marca').checked, fotos: [], drive: {},
     };
     await guardarVisita(v);
     location.hash = `#/visita/${v.id}`;
@@ -629,13 +771,18 @@ async function vistaVisita(vid) {
         <a class="miniatura" href="#/foto/${v.id}/${f.id}">
           ${minis[i] ? `<img src="${urlDe(minis[i])}" alt="${nFoto(f.n)}">` : '<div style="aspect-ratio:4/3"></div>'}
           <span class="num">${nFoto(f.n)}</span>
+          <button class="quitar" data-fid="${f.id}" aria-label="Eliminar ${nFoto(f.n)}">✕</button>
           <div class="pie">${hora(f.hora)}${f.audio ? ' · 🎙' : ''}
             <p class="${f.descripcion?.trim() ? '' : 'falta'}">${esc(f.descripcion?.trim() || (f.pendienteTranscribir ? 'Audio pendiente de transcribir' : 'Sin descripción'))}</p></div>
         </a>`).join('')}</div>` : '<p class="vacio">Haz la primera fotografía.</p>'}
-      <div class="pila" style="margin-top:24px">
+      <label class="interruptor" style="margin-top:20px"><input id="marca" type="checkbox" ${v.marcaAgua ? 'checked' : ''}>
+        <span>Imprimir fecha y hora en las fotos<small>En Drive: copia Fnn_marca.jpg junto al original.</small></span></label>
+      <div class="pila" style="margin-top:20px">
         ${abierta
           ? '<button id="cerrar" class="btn">Cerrar visita y subir a Drive</button>'
           : '<button id="reabrir" class="btn">Reabrir visita para añadir fotos</button>'}
+        ${abierta || v.sync === 'subida' ? '' : '<button id="subir" class="btn primario">Subir cambios a Drive</button>'}
+        ${abierta && v.fotos.length ? '<button id="subir" class="btn">Subir lo hecho hasta ahora a Drive</button>' : ''}
         <button id="borrar" class="btn peligro">Eliminar visita del móvil</button>
       </div>
     </main>
@@ -664,6 +811,20 @@ async function vistaVisita(vid) {
       render();
     };
   }
+  $('#subir')?.addEventListener('click', () => sincronizar(true));
+  $('#marca').onchange = async e => {
+    const act = await DB.get('visitas', vid);
+    act.marcaAgua = e.target.checked;
+    await guardarVisita(act);
+    aviso(act.marcaAgua ? 'Se imprimirá fecha y hora al subir a Drive.' : 'Sin marca: en Drive quedarán solo los originales.');
+    render();
+  };
+  app.querySelectorAll('.quitar').forEach(b => {
+    b.onclick = async e => {
+      e.preventDefault(); // la ✕ está dentro del enlace a la foto
+      if (await eliminarFoto(vid, b.dataset.fid)) render();
+    };
+  });
   $('#borrar').onclick = async () => {
     const aviso1 = v.sync === 'subida'
       ? '¿Eliminar esta visita del móvil? Lo que ya está en Drive se conserva.'
@@ -685,7 +846,9 @@ async function vistaFoto(vid, fid) {
   app.innerHTML = `
     <header class="barra"><a class="icono" href="#/visita/${vid}" aria-label="Volver">←</a>
       <h1>${nFoto(f.n)} · ${hora(f.hora)}</h1></header>
-    ${img ? `<img class="foto-grande" src="${urlDe(img)}" alt="${nFoto(f.n)}">` : '<p class="vacio">Imagen no disponible en este móvil (ya está en Drive).</p>'}
+    ${img ? `<div class="marco-foto"><img class="foto-grande" src="${urlDe(img)}" alt="${nFoto(f.n)}">
+      ${v.marcaAgua ? `<span class="sello" title="Así se imprimirá en la copia de Drive">${textoMarca(f.hora)}</span>` : ''}</div>`
+      : '<p class="vacio">Imagen no disponible en este móvil (ya está en Drive).</p>'}
     <main>
       <label for="desc">Descripción de lo observado</label>
       <textarea id="desc" placeholder="Pulsa el micrófono y describe lo que se ve: elemento, lesión, ubicación exacta, extensión…">${esc(f.descripcion)}</textarea>
@@ -804,17 +967,31 @@ async function vistaFoto(vid, fid) {
   });
 
   $('#eliminar').onclick = async () => {
-    if (!confirm(`¿Eliminar ${nFoto(f.n)}? La numeración de las demás no cambia.`)) return;
-    await pararTodo();
-    const act = await DB.get('visitas', vid);
-    const fa = act.fotos.find(x => x.id === fid);
-    act.drive ||= {};
-    for (const id of [fa.drive?.img, fa.drive?.audio]) if (id) (act.drive.papelera ||= []).push(id);
-    act.fotos = act.fotos.filter(x => x.id !== fid);
-    await borrarFotoLocal(fid);
-    await guardarVisita(act);
+    if (!(await eliminarFoto(vid, fid, pararTodo))) return;
     location.hash = `#/visita/${vid}`;
   };
+}
+
+// Borra la foto con su texto y audio, y renumera las siguientes para que no queden huecos.
+// Lo que ya estaba en Drive va a la papelera y se renombra en la próxima sincronización.
+async function eliminarFoto(vid, fid, antes) {
+  const v = await DB.get('visitas', vid);
+  const i = v.fotos.findIndex(x => x.id === fid);
+  if (i < 0) return false;
+  const f = v.fotos[i];
+  const siguientes = v.fotos.length - i - 1;
+  const texto = `¿Eliminar ${nFoto(f.n)} y su descripción?` +
+    (siguientes ? `\n\nLas fotos posteriores se renumeran: ${nFoto(f.n + 1)} pasará a ser ${nFoto(f.n)}, etc.` : '');
+  if (!confirm(texto)) return false;
+  if (antes) await antes();
+  v.drive ||= {};
+  for (const id of [f.drive?.img, f.drive?.marca, f.drive?.audio]) if (id) (v.drive.papelera ||= []).push(id);
+  v.fotos.splice(i, 1);
+  v.fotos.forEach((x, j) => { x.n = j + 1; });
+  await borrarFotoLocal(fid);
+  await guardarVisita(v);
+  aviso(`${nFoto(f.n)} eliminada.`);
+  return true;
 }
 
 async function vistaAjustes() {
@@ -839,6 +1016,11 @@ async function vistaAjustes() {
         <button id="guardar-cid" class="btn">Guardar y conectar con Drive</button>
       </div>
 
+      <h2>Fotografías</h2>
+      <label class="interruptor"><input id="marca-def" type="checkbox" ${(await marcaPorDefecto()) ? 'checked' : ''}>
+        <span>Fecha y hora impresas por defecto<small>Valor inicial en cada visita nueva; se puede cambiar en cada una.
+          El original sin marca, con sus metadatos, se guarda siempre.</small></span></label>
+
       <h2>Dictado sin cobertura</h2>
       <p class="ayuda" style="margin-top:0">Descarga el modelo de voz en español al móvil para poder transcribir
         en obra sin conexión (Chrome reciente en Android). Hazlo con wifi.</p>
@@ -860,6 +1042,7 @@ async function vistaAjustes() {
     Drive.token = null;
     await sincronizar(true);
   };
+  $('#marca-def').onchange = e => ajuste.poner('marcaAgua', e.target.checked);
   $('#offline').onclick = async () => {
     $('#res-offline').textContent = 'Comprobando…';
     $('#res-offline').textContent = await Dictado.prepararSinConexion();

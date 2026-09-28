@@ -113,6 +113,25 @@ textarea { min-height: 170px; resize: vertical; }
   position: absolute; top: 6px; left: 6px; padding: 2px 7px; border-radius: 6px;
   background: rgba(0,0,0,.7); color: #fff; font-weight: 700; font-size: .8rem;
 }
+.estado.pendiente { background: #fff4dc; border: 1px solid var(--aviso); }
+
+.interruptor {
+  display: flex; gap: 12px; align-items: flex-start; margin: 0; padding: 12px 14px;
+  border: 1px solid var(--linea); border-radius: var(--radio); font-weight: 600; cursor: pointer;
+}
+.interruptor input { width: 24px; height: 24px; margin: 0; flex: none; accent-color: var(--tinta); }
+.interruptor small { display: block; font-weight: 400; color: var(--gris); font-size: .85rem; }
+
+.marco-foto { position: relative; background: #000; }
+.sello {
+  position: absolute; right: 8px; bottom: 8px; padding: 3px 8px;
+  background: rgba(0,0,0,.55); color: #ffd200; font-weight: 600; font-size: .85rem;
+}
+
+.quitar {
+  position: absolute; top: 4px; right: 4px; width: 36px; height: 36px; border: 0; border-radius: 50%;
+  background: rgba(0,0,0,.7); color: #fff; font-size: 1rem; cursor: pointer;
+}
 .falta { color: var(--aviso) !important; font-weight: 600; }
 
 .barra-inferior {
