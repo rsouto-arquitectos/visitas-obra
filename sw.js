@@ -1,7 +1,7 @@
 // Service worker: permite abrir la app sin cobertura.
 // Estrategia «red primero»: con conexión se sirve siempre la última versión;
 // sin conexión, la copia guardada.
-const CACHE = 'visitas-obra-v1';
+const CACHE = 'visitas-obra-v2';
 const ARCHIVOS = [
   './', 'index.html', 'app.js', 'styles.css', 'config.js',
   'manifest.webmanifest', 'icon-192.png', 'icon-512.png',
